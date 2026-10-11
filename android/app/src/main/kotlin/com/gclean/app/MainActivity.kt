@@ -1,4 +1,4 @@
-package com.gclean.drive_cleaner
+package com.gclean.app
 
 import io.flutter.embedding.android.FlutterActivity
 
