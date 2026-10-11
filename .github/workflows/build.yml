@@ -30,10 +30,12 @@ jobs:
         run: flutter pub get
 
       - name: Build APK
-        run: flutter build apk --debug
+        run: |
+          flutter build apk --debug
+          cp build/app/outputs/flutter-apk/app-debug.apk build/app/outputs/flutter-apk/G-Clean.apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: G-Clean-debug
-          path: build/app/outputs/flutter-apk/app-debug.apk
+          name: G-Clean
+          path: build/app/outputs/flutter-apk/G-Clean.apk
