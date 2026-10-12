@@ -6,7 +6,7 @@ import 'package:extension_google_sign_in_as_googleapis_auth/extension_google_sig
 
 final GoogleSignIn _googleSignIn = GoogleSignIn(
   scopes: <String>[
-    drive.DriveApi.driveScope, // Full scope required to trash/delete existing Drive files
+    drive.DriveApi.driveScope,
   ],
 );
 
@@ -128,7 +128,6 @@ class _CleanerHomePageState extends State<CleanerHomePage> {
 
       grouped.forEach((k, v) {
         if (v.length > 1) {
-          // Sort oldest first so original is always index 0
           v.sort((a, b) => (a.modifiedTime ?? DateTime(2000))
               .compareTo(b.modifiedTime ?? DateTime(2000)));
           duplicates[k] = v;
@@ -157,7 +156,6 @@ class _CleanerHomePageState extends State<CleanerHomePage> {
     setState(() {
       _selectedFileIds.clear();
       for (final group in _duplicateGroups.values) {
-        // Keep index 0 (original), select all subsequent copies (index 1+)
         for (int i = 1; i < group.length; i++) {
           if (group[i].id != null) {
             _selectedFileIds.add(group[i].id!);
@@ -183,13 +181,13 @@ class _CleanerHomePageState extends State<CleanerHomePage> {
     if (_driveApi == null || _selectedFileIds.isEmpty) return;
 
     final count = _selectedFileIds.length;
+    final spaceStr = _formatBytes(_calculateSelectedBytes());
+
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Move to Drive Trash?'),
-        content: Text(
-        content: Text('Move ' + count.toString() + ' duplicate file(s) (' + _formatBytes(_calculateSelectedBytes()) + ') to trash?\n\nYou can restore them anytime from Drive Trash.'),
-        ),
+        content: Text('Move $count selected duplicate file(s) ($spaceStr) to Drive Trash? You can restore them anytime within 30 days.'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
