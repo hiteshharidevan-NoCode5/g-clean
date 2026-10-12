@@ -1,125 +1,266 @@
+import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:googleapis/drive/v3.dart' as drive;
+import 'package:extension_google_sign_in_as_googleapis_auth/extension_google_sign_in_as_googleapis_auth.dart';
+
+final GoogleSignIn _googleSignIn = GoogleSignIn(
+  scopes: <String>[
+    drive.DriveApi.driveReadonlyScope,
+    drive.DriveApi.driveFileScope,
+  ],
+);
 
 void main() {
-  runApp(const MyApp());
+  runApp(const GCleanApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class GCleanApp extends StatelessWidget {
+  const GCleanApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      title: 'G-Clean',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF1E5BB2),
+          brightness: Brightness.dark,
+        ),
         useMaterial3: true,
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const CleanerHomePage(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class CleanerHomePage extends StatefulWidget {
+  const CleanerHomePage({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<CleanerHomePage> createState() => _CleanerHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _CleanerHomePageState extends State<CleanerHomePage> {
+  GoogleSignInAccount? _currentUser;
+  drive.DriveApi? _driveApi;
+  bool _isLoading = false;
+  List<drive.File> _largeFiles = [];
+  int _totalBytesScanned = 0;
 
-  void _incrementCounter() {
-    setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+  @override
+  void initState() {
+    super.initState();
+    _googleSignIn.onCurrentUserChanged.listen((account) async {
+      setState(() => _currentUser = account);
+      if (account != null) {
+        final client = await _googleSignIn.authenticatedClient();
+        if (client != null) {
+          _driveApi = drive.DriveApi(client);
+          _scanDrive();
+        }
+      } else {
+        setState(() {
+          _driveApi = null;
+          _largeFiles = [];
+          _totalBytesScanned = 0;
+        });
+      }
     });
+    _googleSignIn.signInSilently();
+  }
+
+  Future<void> _handleSignIn() async {
+    try {
+      await _googleSignIn.signIn();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Sign-in error: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _handleSignOut() async {
+    await _googleSignIn.disconnect();
+  }
+
+  Future<void> _scanDrive() async {
+    if (_driveApi == null) return;
+    setState(() => _isLoading = true);
+
+    try {
+      final fileList = await _driveApi!.files.list(
+        spaces: 'drive',
+        pageSize: 100,
+        orderBy: 'quotaBytesUsed desc',
+        q: "trashed = false and mimeType != 'application/vnd.google-apps.folder'",
+        $fields: 'files(id, name, size, mimeType, modifiedTime, quotaBytesUsed)',
+      );
+
+      final files = fileList.files ?? [];
+      int totalSize = 0;
+      for (final f in files) {
+        totalSize += int.tryParse(f.size ?? '0') ?? 0;
+      }
+
+      setState(() {
+        _largeFiles = files;
+        _totalBytesScanned = totalSize;
+        _isLoading = false;
+      });
+    } catch (e) {
+      setState(() => _isLoading = false);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to scan Drive: $e')),
+        );
+      }
+    }
+  }
+
+  String _formatBytes(int bytes, [int decimals = 2]) {
+    if (bytes <= 0) return '0 B';
+    const suffixes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    final i = (log(bytes) / log(1024)).floor();
+    return '${(bytes / pow(1024, i)).toStringAsFixed(decimals)} ${suffixes[i]}';
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+        title: const Text('G-Clean'),
+        actions: [
+          if (_currentUser != null) ...[
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              tooltip: 'Rescan Drive',
+              onPressed: _isLoading ? null : _scanDrive,
+            ),
+            IconButton(
+              icon: const Icon(Icons.logout),
+              tooltip: 'Sign Out',
+              onPressed: _handleSignOut,
+            ),
+          ]
+        ],
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text(
-              'You have pushed the button this many times:',
+      body: _currentUser == null ? _buildSignInView() : _buildDashboardView(),
+    );
+  }
+
+  Widget _buildSignInView() {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.cloud_sync, size: 80, color: Colors.blueAccent),
+          const SizedBox(height: 16),
+          const Text(
+            'Welcome to G-Clean',
+            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Analyze storage and identify large files on Google Drive',
+            style: TextStyle(color: Colors.white70),
+          ),
+          const SizedBox(height: 24),
+          ElevatedButton.icon(
+            onPressed: _handleSignIn,
+            icon: const Icon(Icons.login),
+            label: const Text('Sign in with Google'),
+            style: ElevatedButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
             ),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
-            ),
-          ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDashboardView() {
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.all(16),
+          color: Theme.of(context).colorScheme.surfaceContainerHighest,
+          child: Row(
+            children: [
+              CircleAvatar(
+                backgroundImage: _currentUser?.photoUrl != null
+                    ? NetworkImage(_currentUser!.photoUrl!)
+                    : null,
+                child: _currentUser?.photoUrl == null
+                    ? const Icon(Icons.person)
+                    : null,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _currentUser?.displayName ?? 'User',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    Text(
+                      _currentUser?.email ?? '',
+                      style: const TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  const Text('Top Files Total', style: TextStyle(fontSize: 11)),
+                  Text(
+                    _formatBytes(_totalBytesScanned),
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: Colors.lightBlueAccent,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
-      ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
+        if (_isLoading)
+          const Expanded(child: Center(child: CircularProgressIndicator()))
+        else if (_largeFiles.isEmpty)
+          const Expanded(
+            child: Center(child: Text('No files found or scanner is idle.')),
+          )
+        else
+          Expanded(
+            child: ListView.separated(
+              itemCount: _largeFiles.length,
+              separatorBuilder: (_, __) => const Divider(height: 1),
+              itemBuilder: (context, index) {
+                final file = _largeFiles[index];
+                final sizeInt = int.tryParse(file.size ?? '0') ?? 0;
+                return ListTile(
+                  leading: const Icon(Icons.insert_drive_file),
+                  title: Text(file.name ?? 'Untitled'),
+                  subtitle: Text(
+                    file.mimeType ?? 'Unknown type',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  trailing: Text(
+                    _formatBytes(sizeInt),
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                );
+              },
+            ),
+          ),
+      ],
     );
   }
 }
