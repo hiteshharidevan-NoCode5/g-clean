@@ -6,8 +6,7 @@ import 'package:extension_google_sign_in_as_googleapis_auth/extension_google_sig
 
 final GoogleSignIn _googleSignIn = GoogleSignIn(
   scopes: <String>[
-    drive.DriveApi.driveReadonlyScope,
-    drive.DriveApi.driveFileScope,
+    drive.DriveApi.driveScope, // Full scope required to trash/delete existing Drive files
   ],
 );
 
@@ -42,21 +41,20 @@ class CleanerHomePage extends StatefulWidget {
   State<CleanerHomePage> createState() => _CleanerHomePageState();
 }
 
-class _CleanerHomePageState extends State<CleanerHomePage> with SingleTickerProviderStateMixin {
+class _CleanerHomePageState extends State<CleanerHomePage> {
   GoogleSignInAccount? _currentUser;
   drive.DriveApi? _driveApi;
   bool _isLoading = false;
-  late TabController _tabController;
+  bool _isDeleting = false;
 
-  List<drive.File> _largeFiles = [];
   Map<String, List<drive.File>> _duplicateGroups = {};
-  int _totalBytesScanned = 0;
+  final Set<String> _selectedFileIds = {};
+  int _totalScannedBytes = 0;
   int _totalWastedBytes = 0;
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
     _googleSignIn.onCurrentUserChanged.listen((account) async {
       setState(() => _currentUser = account);
       if (account != null) {
@@ -68,20 +66,14 @@ class _CleanerHomePageState extends State<CleanerHomePage> with SingleTickerProv
       } else {
         setState(() {
           _driveApi = null;
-          _largeFiles = [];
           _duplicateGroups = {};
-          _totalBytesScanned = 0;
+          _selectedFileIds.clear();
+          _totalScannedBytes = 0;
           _totalWastedBytes = 0;
         });
       }
     });
     _googleSignIn.signInSilently();
-  }
-
-  @override
-  void dispose() {
-    _tabController.dispose();
-    super.dispose();
   }
 
   Future<void> _handleSignIn() async {
@@ -102,7 +94,10 @@ class _CleanerHomePageState extends State<CleanerHomePage> with SingleTickerProv
 
   Future<void> _scanDrive() async {
     if (_driveApi == null) return;
-    setState(() => _isLoading = true);
+    setState(() {
+      _isLoading = true;
+      _selectedFileIds.clear();
+    });
 
     try {
       final fileList = await _driveApi!.files.list(
@@ -121,7 +116,6 @@ class _CleanerHomePageState extends State<CleanerHomePage> with SingleTickerProv
         final bytes = int.tryParse(f.size ?? '0') ?? 0;
         totalSize += bytes;
 
-        // Group by md5 checksum if available; otherwise by name + size
         final key = (f.md5Checksum != null && f.md5Checksum!.isNotEmpty)
             ? 'hash_${f.md5Checksum}'
             : 'meta_${f.name}_${f.size}';
@@ -129,12 +123,14 @@ class _CleanerHomePageState extends State<CleanerHomePage> with SingleTickerProv
         grouped.putIfAbsent(key, () => []).add(f);
       }
 
-      // Keep only keys that have 2 or more files
       final Map<String, List<drive.File>> duplicates = {};
       int wasted = 0;
 
       grouped.forEach((k, v) {
         if (v.length > 1) {
+          // Sort oldest first so original is always index 0
+          v.sort((a, b) => (a.modifiedTime ?? DateTime(2000))
+              .compareTo(b.modifiedTime ?? DateTime(2000)));
           duplicates[k] = v;
           final individualSize = int.tryParse(v.first.size ?? '0') ?? 0;
           wasted += individualSize * (v.length - 1);
@@ -142,9 +138,8 @@ class _CleanerHomePageState extends State<CleanerHomePage> with SingleTickerProv
       });
 
       setState(() {
-        _largeFiles = files;
         _duplicateGroups = duplicates;
-        _totalBytesScanned = totalSize;
+        _totalScannedBytes = totalSize;
         _totalWastedBytes = wasted;
         _isLoading = false;
       });
@@ -158,6 +153,84 @@ class _CleanerHomePageState extends State<CleanerHomePage> with SingleTickerProv
     }
   }
 
+  void _autoSelectDuplicates() {
+    setState(() {
+      _selectedFileIds.clear();
+      for (final group in _duplicateGroups.values) {
+        // Keep index 0 (original), select all subsequent copies (index 1+)
+        for (int i = 1; i < group.length; i++) {
+          if (group[i].id != null) {
+            _selectedFileIds.add(group[i].id!);
+          }
+        }
+      }
+    });
+  }
+
+  int _calculateSelectedBytes() {
+    int bytes = 0;
+    for (final group in _duplicateGroups.values) {
+      for (final f in group) {
+        if (_selectedFileIds.contains(f.id)) {
+          bytes += int.tryParse(f.size ?? '0') ?? 0;
+        }
+      }
+    }
+    return bytes;
+  }
+
+  Future<void> _trashSelectedFiles() async {
+    if (_driveApi == null || _selectedFileIds.isEmpty) return;
+
+    final count = _selectedFileIds.length;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Move to Drive Trash?'),
+        content: Text(
+          'Move $count selected duplicate file(s) (${_formatBytes(_calculateSelectedBytes())}) to trash?
+
+You can restore them from Google Drive Trash anytime within 30 days.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Move to Trash'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    setState(() => _isDeleting = true);
+
+    int successCount = 0;
+    for (final id in _selectedFileIds.toList()) {
+      try {
+        final patch = drive.File()..trashed = true;
+        await _driveApi!.files.update(patch, id);
+        successCount++;
+      } catch (e) {
+        debugPrint('Error trashing file $id: $e');
+      }
+    }
+
+    setState(() => _isDeleting = false);
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Successfully trashed $successCount file(s).')),
+      );
+    }
+    _scanDrive();
+  }
+
   String _formatBytes(int bytes, [int decimals = 2]) {
     if (bytes <= 0) return '0 B';
     const suffixes = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -169,29 +242,13 @@ class _CleanerHomePageState extends State<CleanerHomePage> with SingleTickerProv
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('G-Clean'),
-        bottom: _currentUser != null
-            ? TabBar(
-                controller: _tabController,
-                indicatorColor: Colors.lightBlueAccent,
-                tabs: [
-                  Tab(
-                    icon: const Icon(Icons.fitness_center),
-                    text: 'Top Files (${_largeFiles.length})',
-                  ),
-                  Tab(
-                    icon: const Icon(Icons.copy_all),
-                    text: 'Duplicates (${_duplicateGroups.length})',
-                  ),
-                ],
-              )
-            : null,
+        title: const Text('G-Clean Duplicate Finder'),
         actions: [
           if (_currentUser != null) ...[
             IconButton(
               icon: const Icon(Icons.refresh),
-              tooltip: 'Rescan Drive',
-              onPressed: _isLoading ? null : _scanDrive,
+              tooltip: 'Rescan',
+              onPressed: _isLoading || _isDeleting ? null : _scanDrive,
             ),
             IconButton(
               icon: const Icon(Icons.logout),
@@ -202,6 +259,17 @@ class _CleanerHomePageState extends State<CleanerHomePage> with SingleTickerProv
         ],
       ),
       body: _currentUser == null ? _buildSignInView() : _buildDashboardView(),
+      floatingActionButton: _selectedFileIds.isNotEmpty
+          ? FloatingActionButton.extended(
+              backgroundColor: Colors.redAccent,
+              onPressed: _isDeleting ? null : _trashSelectedFiles,
+              icon: const Icon(Icons.delete_sweep, color: Colors.white),
+              label: Text(
+                'Trash ${_selectedFileIds.length} Duplicate(s) (${_formatBytes(_calculateSelectedBytes())})',
+                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+              ),
+            )
+          : null,
     );
   }
 
@@ -218,7 +286,7 @@ class _CleanerHomePageState extends State<CleanerHomePage> with SingleTickerProv
           ),
           const SizedBox(height: 8),
           const Text(
-            'Analyze storage and clean duplicate files on Google Drive',
+            'Find and clean duplicate files on Google Drive',
             style: TextStyle(color: Colors.white70),
           ),
           const SizedBox(height: 24),
@@ -261,7 +329,7 @@ class _CleanerHomePageState extends State<CleanerHomePage> with SingleTickerProv
                       style: const TextStyle(fontWeight: FontWeight.bold),
                     ),
                     Text(
-                      _currentUser?.email ?? '',
+                      '${_duplicateGroups.length} duplicate groups detected',
                       style: const TextStyle(color: Colors.white70, fontSize: 12),
                     ),
                   ],
@@ -276,6 +344,7 @@ class _CleanerHomePageState extends State<CleanerHomePage> with SingleTickerProv
                     style: const TextStyle(
                       fontWeight: FontWeight.bold,
                       color: Colors.amberAccent,
+                      fontSize: 16,
                     ),
                   ),
                 ],
@@ -283,92 +352,124 @@ class _CleanerHomePageState extends State<CleanerHomePage> with SingleTickerProv
             ],
           ),
         ),
-        if (_isLoading)
-          const Expanded(child: Center(child: CircularProgressIndicator()))
-        else
-          Expanded(
-            child: TabBarView(
-              controller: _tabController,
+        if (_duplicateGroups.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                _buildTopFilesList(),
-                _buildDuplicatesList(),
+                OutlinedButton.icon(
+                  onPressed: _autoSelectDuplicates,
+                  icon: const Icon(Icons.auto_fix_high, size: 18),
+                  label: const Text('Auto-Select Redundant Copies'),
+                ),
+                TextButton(
+                  onPressed: () => setState(() => _selectedFileIds.clear()),
+                  child: const Text('Clear Selection'),
+                ),
               ],
             ),
           ),
+        if (_isLoading || _isDeleting)
+          const Expanded(child: Center(child: CircularProgressIndicator()))
+        else if (_duplicateGroups.isEmpty)
+          const Expanded(
+            child: Center(
+              child: Text(
+                'No duplicate files detected across scanned items! 🎉',
+                style: TextStyle(fontSize: 16),
+              ),
+            ),
+          )
+        else
+          Expanded(child: _buildDuplicatesView()),
       ],
     );
   }
 
-  Widget _buildTopFilesList() {
-    if (_largeFiles.isEmpty) {
-      return const Center(child: Text('No files found on Drive.'));
-    }
-    return ListView.separated(
-      itemCount: _largeFiles.length,
-      separatorBuilder: (_, __) => const Divider(height: 1),
-      itemBuilder: (context, index) {
-        final file = _largeFiles[index];
-        final sizeInt = int.tryParse(file.size ?? '0') ?? 0;
-        return ListTile(
-          leading: const Icon(Icons.insert_drive_file),
-          title: Text(file.name ?? 'Untitled'),
-          subtitle: Text(
-            file.mimeType ?? 'Unknown type',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          trailing: Text(
-            _formatBytes(sizeInt),
-            style: const TextStyle(fontWeight: FontWeight.w600),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildDuplicatesList() {
-    if (_duplicateGroups.isEmpty) {
-      return const Center(
-        child: Text('No duplicate files found across scanned items! 🎉'),
-      );
-    }
-
+  Widget _buildDuplicatesView() {
     final groups = _duplicateGroups.values.toList();
     return ListView.builder(
       itemCount: groups.length,
+      padding: const EdgeInsets.only(bottom: 80),
       itemBuilder: (context, index) {
         final group = groups[index];
         final sample = group.first;
         final sizeInt = int.tryParse(sample.size ?? '0') ?? 0;
-        final wastedInGroup = sizeInt * (group.length - 1);
+        final wasted = sizeInt * (group.length - 1);
 
         return Card(
-          margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-          child: ExpansionTile(
-            leading: const Icon(Icons.copy, color: Colors.amberAccent),
-            title: Text(sample.name ?? 'Duplicate group'),
-            subtitle: Text(
-              '${group.length} copies • ${_formatBytes(wastedInGroup)} wasted',
-              style: const TextStyle(color: Colors.amberAccent, fontSize: 13),
-            ),
-            trailing: Text(
-              _formatBytes(sizeInt),
-              style: const TextStyle(fontWeight: FontWeight.bold),
-            ),
-            children: group.map((file) {
-              return ListTile(
-                dense: true,
-                leading: const Icon(Icons.file_present_outlined, size: 20),
-                title: Text(file.name ?? 'Untitled'),
-                subtitle: Text('ID: ${file.id}'),
-                trailing: Text(
-                  file.modifiedTime != null
-                      ? '${file.modifiedTime!.year}-${file.modifiedTime!.month.toString().padLeft(2, '0')}-${file.modifiedTime!.day.toString().padLeft(2, '0')}'
-                      : '',
-                  style: const TextStyle(fontSize: 12, color: Colors.white60),
+          margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.copy_all, color: Colors.amberAccent),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        sample.name ?? 'Duplicate Group',
+                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    Text(
+                      _formatBytes(sizeInt),
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ],
                 ),
-              );
-            }).toList(),
+                Padding(
+                  padding: const EdgeInsets.only(left: 32, top: 4, bottom: 8),
+                  child: Text(
+                    '${group.length} copies found • ${_formatBytes(wasted)} wasted storage',
+                    style: const TextStyle(color: Colors.amberAccent, fontSize: 12),
+                  ),
+                ),
+                const Divider(height: 1),
+                ...group.asMap().entries.map((entry) {
+                  final idx = entry.key;
+                  final file = entry.value;
+                  final isOriginal = idx == 0;
+                  final isChecked = _selectedFileIds.contains(file.id);
+
+                  return CheckboxListTile(
+                    dense: true,
+                    value: isChecked,
+                    activeColor: Colors.redAccent,
+                    onChanged: (val) {
+                      setState(() {
+                        if (val == true && file.id != null) {
+                          _selectedFileIds.add(file.id!);
+                        } else if (file.id != null) {
+                          _selectedFileIds.remove(file.id!);
+                        }
+                      });
+                    },
+                    secondary: Icon(
+                      isOriginal ? Icons.verified : Icons.content_copy,
+                      color: isOriginal ? Colors.greenAccent : Colors.white54,
+                    ),
+                    title: Text(
+                      file.name ?? 'Untitled',
+                      style: TextStyle(
+                        decoration: isChecked ? TextDecoration.lineThrough : null,
+                      ),
+                    ),
+                    subtitle: Text(
+                      '${isOriginal ? "Original (keep) • " : "Duplicate copy • "}Modified: ${file.modifiedTime != null ? file.modifiedTime!.toLocal().toString().split(".")[0] : "Unknown"}',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: isOriginal ? Colors.greenAccent : Colors.white60,
+                      ),
+                    ),
+                  );
+                }),
+              ],
+            ),
           ),
         );
       },
