@@ -42,16 +42,21 @@ class CleanerHomePage extends StatefulWidget {
   State<CleanerHomePage> createState() => _CleanerHomePageState();
 }
 
-class _CleanerHomePageState extends State<CleanerHomePage> {
+class _CleanerHomePageState extends State<CleanerHomePage> with SingleTickerProviderStateMixin {
   GoogleSignInAccount? _currentUser;
   drive.DriveApi? _driveApi;
   bool _isLoading = false;
+  late TabController _tabController;
+
   List<drive.File> _largeFiles = [];
+  Map<String, List<drive.File>> _duplicateGroups = {};
   int _totalBytesScanned = 0;
+  int _totalWastedBytes = 0;
 
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: 2, vsync: this);
     _googleSignIn.onCurrentUserChanged.listen((account) async {
       setState(() => _currentUser = account);
       if (account != null) {
@@ -64,11 +69,19 @@ class _CleanerHomePageState extends State<CleanerHomePage> {
         setState(() {
           _driveApi = null;
           _largeFiles = [];
+          _duplicateGroups = {};
           _totalBytesScanned = 0;
+          _totalWastedBytes = 0;
         });
       }
     });
     _googleSignIn.signInSilently();
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
   }
 
   Future<void> _handleSignIn() async {
@@ -94,21 +107,45 @@ class _CleanerHomePageState extends State<CleanerHomePage> {
     try {
       final fileList = await _driveApi!.files.list(
         spaces: 'drive',
-        pageSize: 100,
+        pageSize: 500,
         orderBy: 'quotaBytesUsed desc',
         q: "trashed = false and mimeType != 'application/vnd.google-apps.folder'",
-        $fields: 'files(id, name, size, mimeType, modifiedTime, quotaBytesUsed)',
+        $fields: 'files(id, name, size, mimeType, modifiedTime, quotaBytesUsed, md5Checksum)',
       );
 
       final files = fileList.files ?? [];
       int totalSize = 0;
+      final Map<String, List<drive.File>> grouped = {};
+
       for (final f in files) {
-        totalSize += int.tryParse(f.size ?? '0') ?? 0;
+        final bytes = int.tryParse(f.size ?? '0') ?? 0;
+        totalSize += bytes;
+
+        // Group by md5 checksum if available; otherwise by name + size
+        final key = (f.md5Checksum != null && f.md5Checksum!.isNotEmpty)
+            ? 'hash_${f.md5Checksum}'
+            : 'meta_${f.name}_${f.size}';
+
+        grouped.putIfAbsent(key, () => []).add(f);
       }
+
+      // Keep only keys that have 2 or more files
+      final Map<String, List<drive.File>> duplicates = {};
+      int wasted = 0;
+
+      grouped.forEach((k, v) {
+        if (v.length > 1) {
+          duplicates[k] = v;
+          final individualSize = int.tryParse(v.first.size ?? '0') ?? 0;
+          wasted += individualSize * (v.length - 1);
+        }
+      });
 
       setState(() {
         _largeFiles = files;
+        _duplicateGroups = duplicates;
         _totalBytesScanned = totalSize;
+        _totalWastedBytes = wasted;
         _isLoading = false;
       });
     } catch (e) {
@@ -133,6 +170,22 @@ class _CleanerHomePageState extends State<CleanerHomePage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('G-Clean'),
+        bottom: _currentUser != null
+            ? TabBar(
+                controller: _tabController,
+                indicatorColor: Colors.lightBlueAccent,
+                tabs: [
+                  Tab(
+                    icon: const Icon(Icons.fitness_center),
+                    text: 'Top Files (${_largeFiles.length})',
+                  ),
+                  Tab(
+                    icon: const Icon(Icons.copy_all),
+                    text: 'Duplicates (${_duplicateGroups.length})',
+                  ),
+                ],
+              )
+            : null,
         actions: [
           if (_currentUser != null) ...[
             IconButton(
@@ -165,7 +218,7 @@ class _CleanerHomePageState extends State<CleanerHomePage> {
           ),
           const SizedBox(height: 8),
           const Text(
-            'Analyze storage and identify large files on Google Drive',
+            'Analyze storage and clean duplicate files on Google Drive',
             style: TextStyle(color: Colors.white70),
           ),
           const SizedBox(height: 24),
@@ -186,7 +239,7 @@ class _CleanerHomePageState extends State<CleanerHomePage> {
     return Column(
       children: [
         Container(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           color: Theme.of(context).colorScheme.surfaceContainerHighest,
           child: Row(
             children: [
@@ -217,12 +270,12 @@ class _CleanerHomePageState extends State<CleanerHomePage> {
               Column(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  const Text('Top Files Total', style: TextStyle(fontSize: 11)),
+                  const Text('Wasted in Duplicates', style: TextStyle(fontSize: 11, color: Colors.amberAccent)),
                   Text(
-                    _formatBytes(_totalBytesScanned),
+                    _formatBytes(_totalWastedBytes),
                     style: const TextStyle(
                       fontWeight: FontWeight.bold,
-                      color: Colors.lightBlueAccent,
+                      color: Colors.amberAccent,
                     ),
                   ),
                 ],
@@ -232,35 +285,93 @@ class _CleanerHomePageState extends State<CleanerHomePage> {
         ),
         if (_isLoading)
           const Expanded(child: Center(child: CircularProgressIndicator()))
-        else if (_largeFiles.isEmpty)
-          const Expanded(
-            child: Center(child: Text('No files found or scanner is idle.')),
-          )
         else
           Expanded(
-            child: ListView.separated(
-              itemCount: _largeFiles.length,
-              separatorBuilder: (_, __) => const Divider(height: 1),
-              itemBuilder: (context, index) {
-                final file = _largeFiles[index];
-                final sizeInt = int.tryParse(file.size ?? '0') ?? 0;
-                return ListTile(
-                  leading: const Icon(Icons.insert_drive_file),
-                  title: Text(file.name ?? 'Untitled'),
-                  subtitle: Text(
-                    file.mimeType ?? 'Unknown type',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  trailing: Text(
-                    _formatBytes(sizeInt),
-                    style: const TextStyle(fontWeight: FontWeight.w600),
-                  ),
-                );
-              },
+            child: TabBarView(
+              controller: _tabController,
+              children: [
+                _buildTopFilesList(),
+                _buildDuplicatesList(),
+              ],
             ),
           ),
       ],
+    );
+  }
+
+  Widget _buildTopFilesList() {
+    if (_largeFiles.isEmpty) {
+      return const Center(child: Text('No files found on Drive.'));
+    }
+    return ListView.separated(
+      itemCount: _largeFiles.length,
+      separatorBuilder: (_, __) => const Divider(height: 1),
+      itemBuilder: (context, index) {
+        final file = _largeFiles[index];
+        final sizeInt = int.tryParse(file.size ?? '0') ?? 0;
+        return ListTile(
+          leading: const Icon(Icons.insert_drive_file),
+          title: Text(file.name ?? 'Untitled'),
+          subtitle: Text(
+            file.mimeType ?? 'Unknown type',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          trailing: Text(
+            _formatBytes(sizeInt),
+            style: const TextStyle(fontWeight: FontWeight.w600),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildDuplicatesList() {
+    if (_duplicateGroups.isEmpty) {
+      return const Center(
+        child: Text('No duplicate files found across scanned items! 🎉'),
+      );
+    }
+
+    final groups = _duplicateGroups.values.toList();
+    return ListView.builder(
+      itemCount: groups.length,
+      itemBuilder: (context, index) {
+        final group = groups[index];
+        final sample = group.first;
+        final sizeInt = int.tryParse(sample.size ?? '0') ?? 0;
+        final wastedInGroup = sizeInt * (group.length - 1);
+
+        return Card(
+          margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: ExpansionTile(
+            leading: const Icon(Icons.copy, color: Colors.amberAccent),
+            title: Text(sample.name ?? 'Duplicate group'),
+            subtitle: Text(
+              '${group.length} copies • ${_formatBytes(wastedInGroup)} wasted',
+              style: const TextStyle(color: Colors.amberAccent, fontSize: 13),
+            ),
+            trailing: Text(
+              _formatBytes(sizeInt),
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            children: group.map((file) {
+              return ListTile(
+                dense: true,
+                leading: const Icon(Icons.file_present_outlined, size: 20),
+                title: Text(file.name ?? 'Untitled'),
+                subtitle: Text('ID: ${file.id}'),
+                trailing: Text(
+                  file.modifiedTime != null
+                      ? '${file.modifiedTime!.year}-${file.modifiedTime!.month.toString().padLeft(2, '0')}-${file.modifiedTime!.day.toString().padLeft(2, '0')}'
+                      : '',
+                  style: const TextStyle(fontSize: 12, color: Colors.white60),
+                ),
+              );
+            }).toList(),
+          ),
+        );
+      },
     );
   }
 }
