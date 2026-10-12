@@ -188,9 +188,7 @@ class _CleanerHomePageState extends State<CleanerHomePage> {
       builder: (ctx) => AlertDialog(
         title: const Text('Move to Drive Trash?'),
         content: Text(
-          'Move $count selected duplicate file(s) (${_formatBytes(_calculateSelectedBytes())}) to trash?
-
-You can restore them from Google Drive Trash anytime within 30 days.',
+        content: Text('Move ' + count.toString() + ' duplicate file(s) (' + _formatBytes(_calculateSelectedBytes()) + ') to trash?\n\nYou can restore them anytime from Drive Trash.'),
         ),
         actions: [
           TextButton(
